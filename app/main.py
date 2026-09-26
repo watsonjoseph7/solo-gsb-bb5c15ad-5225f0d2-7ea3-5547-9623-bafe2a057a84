@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.schemas import (
     AmbiguityReviewResponse,
+    ConfirmedReviewRequest,
     ErrorResponse,
     RescanPlanRequest,
     RescanPlanResponse,
@@ -17,10 +18,12 @@ from app.schemas import (
     VerificationPlanResponse,
 )
 from app.solver import (
+    ConflictingConfirmationsError,
     InvalidRangeError,
     NoFeasibleCombinationError,
     NoFeasibleSequenceError,
     solve_ambiguity_review,
+    solve_confirmed_review,
     solve_rescan_plan,
     solve_review,
     solve_strip_directions,
@@ -40,8 +43,11 @@ app = FastAPI(
         "供人工确认尚不能唯一确定帧号的扫描帧。"
         "人工核验计划接口进一步利用最优路径的分叉与汇合关系，"
         "求出能唯一锁定基准指派的最少人工核验帧集合。"
+        "人工确认复核接口则直接接收 1～12 条位置-帧号确认，"
+        "在固定首末帧、严格递增与相邻缺帧上限下求最低代价指派，"
+        "并在确认导致无解时返回不可再删减的冲突确认集。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -75,6 +81,21 @@ async def no_feasible_combination_handler(
     )
 
 
+@app.exception_handler(ConflictingConfirmationsError)
+async def conflicting_confirmations_handler(
+    _request: Request, exc: ConflictingConfirmationsError
+) -> JSONResponse:
+    # 输入本身合法，但人工确认与首末固定/严格递增/缺帧上限冲突 -> 422
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": exc.code,
+            "message": exc.message,
+            "conflicting_confirmations": exc.confirmations,
+        },
+    )
+
+
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -102,6 +123,27 @@ async def review_frames(request: ReviewRequest) -> ReviewResponse:
 async def review_ambiguity(request: ReviewRequest) -> AmbiguityReviewResponse:
     result = solve_ambiguity_review(request.model_dump())
     return AmbiguityReviewResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/confirmed-frame-reviews",
+    response_model=ReviewResponse,
+    tags=["review"],
+    summary="带 1～12 条人工确认的逐帧帧号复核",
+    responses={
+        422: {
+            "model": ErrorResponse,
+            "description": (
+                "参数非法、无确认时已无合法序列，或人工确认互相冲突"
+            ),
+        }
+    },
+)
+async def review_confirmed_frames(
+    request: ConfirmedReviewRequest,
+) -> ReviewResponse:
+    result = solve_confirmed_review(request.model_dump())
+    return ReviewResponse.model_validate(result)
 
 
 @app.post(

@@ -22,6 +22,12 @@
 人工核验帧**——只要这些帧的真实帧号与基准一致，其他所有同代价合法序列
 都被排除；返回基准帧号序列与每个核验帧的位置、ID、预期帧号。
 
+另有人工确认复核接口：沿用逐帧复核的请求与代价规则，另收 **1～12 条**
+`{position, frame_number}` 人工确认，被确认的位置只能取确认帧号，其余
+位置仍按同一套规则求最低代价指派；确认帧号未命中候选时该帧按推断计价。
+若确认与固定首末帧、严格递增或相邻缺帧上限冲突，返回 HTTP `422` 与
+**不可再删减的冲突确认集**。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
 - 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
   + 复扫窗口划分动态规划 + 最优路径 DAG 分叉-汇合区间的最小命中集
@@ -36,12 +42,13 @@ docker compose up --build -d
 ```
 
 一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`。启动后可直接使用五个接口：
+`8000`。启动后可直接使用六个接口：
 
 - API 地址：`http://localhost:8000`
-- 交互式文档（Swagger UI，五个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，六个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
+- 人工确认复核：`POST http://localhost:8000/api/v1/confirmed-frame-reviews`
 - 歧义核验：`POST http://localhost:8000/api/v1/ambiguity-reviews`
 - 人工核验计划：`POST http://localhost:8000/api/v1/verification-plans`
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
@@ -59,6 +66,7 @@ docker compose down
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/v1/frame-reviews` | 逐帧复核：单条扫描序列的帧号指派 |
+| `POST` | `/api/v1/confirmed-frame-reviews` | 人工确认复核：锁定 1～12 个位置的帧号后求最低代价指派 |
 | `POST` | `/api/v1/ambiguity-reviews` | 歧义核验：每帧在所有最低代价合法序列中的可取帧号 |
 | `POST` | `/api/v1/verification-plans` | 人工核验计划：锁定基准指派所需的最少核验帧 |
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
@@ -175,6 +183,179 @@ curl -s -X POST http://localhost:8000/api/v1/frame-reviews \
 #### 无合法序列示例
 
 帧号区间无法容纳全部扫描帧（如 3 帧却只给了 2 个帧号）：
+
+```json
+{
+  "error": "no_feasible_sequence",
+  "message": "帧号区间 [1, 2] 只有 2 个帧号，无法为 3 帧指派严格递增的帧号"
+}
+```
+
+### `POST /api/v1/confirmed-frame-reviews`
+
+在逐帧复核的基础上接受**人工确认**：请求体沿用逐帧复核的全部字段
+（`first` / `last` / `max_missing_between` / `frames`，校验规则相同），
+另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `confirmations` | 数组 | **1～12 条**人工确认，必填 |
+| `confirmations[].position` | int | 扫描位置，从 `1` 开始，不得重复、不超出帧数 |
+| `confirmations[].frame_number` | int | 人工确认的帧号，必须落在 `[first, last]` 之内 |
+
+指派与代价规则：
+
+- 被确认的位置**只能取确认帧号**，其余位置仍在首帧固定 `first`、末帧
+  固定 `last`、严格递增、相邻差 ∈ `[1, max_missing_between + 1]` 的约束
+  下，按同一套候选/推断/缺帧代价求**最低代价指派**，同分仍按**帧号序列
+  字典序最小**裁决；
+- 确认只锁定位置的取值，**不改变代价**：确认帧号命中该帧候选时按
+  `100 - 置信分` 计价，**未命中候选时该帧按推断计价（代价 100）**；
+- 成功响应与逐帧复核**完全相同**（逐帧指派、舍弃候选、缺失帧号与各项
+  代价汇总）；
+- 参数非法（数量越界、`position` 重复或越界、帧号不在 `[first, last]`
+  等）返回 HTTP `422` / `invalid_range`；
+- **没有任何确认时就已经无合法序列**（如帧号区间容不下全部扫描帧），
+  沿用逐帧复核的 HTTP `422` / `no_feasible_sequence`；
+- **确认导致无解**时返回 HTTP `422` / `conflicting_confirmations`，并在
+  `conflicting_confirmations` 中给出按 `position` 升序的**不可再删减冲突
+  确认集**：从确认全集按位置升序逐条尝试删除，删除后仍无解的确认永久
+  删除，删除后恢复可行的保留；最终集合中删掉任意一条都会恢复可行。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/confirmed-frame-reviews \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 10,
+    "last": 16,
+    "max_missing_between": 2,
+    "frames": [
+      {"id": "scan-001", "candidates": [{"frame_number": 10, "confidence": 95}]},
+      {"id": "scan-002", "candidates": [{"frame_number": 11, "confidence": 90}]},
+      {"id": "scan-003", "candidates": []},
+      {"id": "scan-004", "candidates": [{"frame_number": 16, "confidence": 85}]},
+    ],
+    "confirmations": [
+      {"position": 3, "frame_number": 14}
+    ]
+  }'
+```
+
+#### 响应示例
+
+`scan-003` 没有候选：逐帧复核在同代价时取字典序最小的 13；人工确认锁定
+为 14 后，该帧未命中候选，按**推断**计价 `100`，但总代价与确认前同为
+最低值 `220`（整条序列固定缺 3 帧，缺帧代价不变）。响应结构与逐帧复核
+一致：
+
+```json
+{
+  "first": 10,
+  "last": 16,
+  "max_missing_between": 2,
+  "frame_count": 4,
+  "assigned_frame_numbers": [10, 11, 14, 16],
+  "total_cost": 220,
+  "candidate_cost_total": 130,
+  "missing_penalty_total": 90,
+  "missing_frame_numbers": [12, 13, 15],
+  "missing_frame_count": 3,
+  "discarded_candidate_count": 0,
+  "frames": [
+    {
+      "position": 1,
+      "id": "scan-001",
+      "assigned_frame_number": 10,
+      "source": "candidate",
+      "matched_candidate_index": 0,
+      "assigned_cost": 5,
+      "missing_after": 0,
+      "missing_penalty": 0,
+      "discarded_candidates": []
+    },
+    {
+      "position": 2,
+      "id": "scan-002",
+      "assigned_frame_number": 11,
+      "source": "candidate",
+      "matched_candidate_index": 0,
+      "assigned_cost": 10,
+      "missing_after": 2,
+      "missing_penalty": 60,
+      "discarded_candidates": []
+    },
+    {
+      "position": 3,
+      "id": "scan-003",
+      "assigned_frame_number": 14,
+      "source": "inferred",
+      "matched_candidate_index": null,
+      "assigned_cost": 100,
+      "missing_after": 1,
+      "missing_penalty": 30,
+      "discarded_candidates": []
+    },
+    {
+      "position": 4,
+      "id": "scan-004",
+      "assigned_frame_number": 16,
+      "source": "candidate",
+      "matched_candidate_index": 0,
+      "assigned_cost": 15,
+      "missing_after": 0,
+      "missing_penalty": 0,
+      "discarded_candidates": []
+    }
+  ]
+}
+```
+
+#### 确认冲突示例
+
+下例共 3 条确认：第 1 帧确认 13 与固定首帧 `first=10` 冲突、第 2 帧确认
+11 与第 3 帧确认 15 的相邻差为 4，超过 `max_missing_between + 1 = 3`。
+从全集按位置升序逐条删减：删掉第 1 帧的确认后仍然无解（后两条依旧
+冲突），故它被永久删除；删掉第 2 帧或第 3 帧的确认后都能恢复可行，二者
+保留为不可再删减冲突集：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/confirmed-frame-reviews \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first": 10,
+    "last": 16,
+    "max_missing_between": 2,
+    "frames": [
+      {"id": "scan-001", "candidates": [{"frame_number": 10, "confidence": 95}]},
+      {"id": "scan-002", "candidates": [{"frame_number": 11, "confidence": 90}]},
+      {"id": "scan-003", "candidates": []},
+      {"id": "scan-004", "candidates": [{"frame_number": 16, "confidence": 85}]}
+    ],
+    "confirmations": [
+      {"position": 1, "frame_number": 13},
+      {"position": 2, "frame_number": 11},
+      {"position": 3, "frame_number": 15}
+    ]
+  }'
+```
+
+HTTP `422` 响应：
+
+```json
+{
+  "error": "conflicting_confirmations",
+  "message": "人工确认与固定首末帧、严格递增或相邻缺帧上限相冲突：第 2 帧确认帧号 11、第 3 帧确认帧号 15",
+  "conflicting_confirmations": [
+    {"position": 2, "frame_number": 11},
+    {"position": 3, "frame_number": 15}
+  ]
+}
+```
+
+若不加任何确认时就不存在合法序列（如帧号区间容不下全部扫描帧），则
+仍返回：
 
 ```json
 {
@@ -608,6 +789,11 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
   O(n · span)；方向组合最多 16 个；
 - 回溯时在保持最优代价的前提下每一步选最小偏移量，后缀最优与历史无关，
   因此贪心回溯得到的就是字典序最小的最优帧号序列；
+- 人工确认复核（`/api/v1/confirmed-frame-reviews`）复用同一 DP：把被确认
+  位置的可行偏移收敛为单点（首末帧仍分别固定 `0`、`span`），后缀/前缀
+  扫描在单点处直接在后继/前驱窗口内枚举最优转移，其余位置的单调队列
+  优化、代价规则与字典序同分裁决完全不变；确认本身不改变代价，未命中
+  候选的确认帧同样计推断代价；
 - 歧义核验（`/api/v1/ambiguity-reviews`）再对称地计算前缀 DP：
   `prefix[i][d]` 表示第 i 帧取 `first+d` 时第 0..i 帧的最小代价（同样用
   单调队列、O(n·span)）。帧 i 取偏移 d 能出现在某条全局最优合法序列中，

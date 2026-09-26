@@ -125,6 +125,17 @@ class NoFeasibleCombinationError(ReviewError):
     code = "no_feasible_combination"
 
 
+class ConflictingConfirmationsError(ReviewError):
+    """人工确认与固定首末帧/严格递增/相邻缺帧上限相冲突。"""
+
+    code = "conflicting_confirmations"
+
+    def __init__(self, message: str, confirmations: list[dict[str, int]]):
+        super().__init__(message)
+        # 不可再删减的冲突确认集 [{position, frame_number}]，按位置升序
+        self.confirmations = confirmations
+
+
 def _to_decimal(value: Any, field: str, range_desc: str = "0～100") -> Decimal:
     """把 JSON 中的数字转成 Decimal；拒绝 NaN/Infinity 等非法数值。"""
     try:
@@ -265,17 +276,34 @@ def _solve_assignment(
     last: int,
     gap: int,
     parsed: list[tuple[Any, list[dict[str, Any]]]],
+    *,
+    pins: dict[int, int] | None = None,
+    with_prefix: bool = True,
 ) -> dict[str, Any]:
     """对一条已按扫描顺序排好的帧序列执行帧号指派。
 
-    返回内部解法（代价为乘以 cost_scale 的整数），供两个接口各自组装
+    返回内部解法（代价为乘以 cost_scale 的整数），供各接口各自组装
     响应；无合法序列时抛 NoFeasibleSequenceError。
+
+    ``pins`` 为人工确认 {位置下标 i: 指派帧号}：被确认的位置只能取确认
+    帧号，其余位置仍按同一套代价规则自由指派；确认帧号本身不改变该帧的
+    命中/推断代价（未命中候选即按推断计价）。``pins`` 的帧号合法性（落在
+    [first, last]、与首末固定一致、彼此严格递增且步长合法）由调用方保证
+    或通过本函数的不可行报错体现。
+
+    ``with_prefix`` 为 False 时跳过仅供歧义/核验接口使用的前缀 DP。
     """
     n = len(parsed)
     span = last - first
     max_step = gap + 1  # 相邻指派帧号之差上限（差 1 表示不缺帧）
+    # DP 内部统一使用偏移 offset = 帧号 - first
+    pins = {pos: number - first for pos, number in (pins or {}).items()}
 
     best_by_frame = _best_candidates(parsed)
+
+    # 确认偏移必须落在可行域 [0, span]，否则绝无合法序列
+    if any(not (0 <= offset <= span) for offset in pins.values()):
+        raise NoFeasibleSequenceError("人工确认帧号与固定首末帧约束相冲突")
 
     # ---- 可行性前置检查 ----
     if span < n - 1:
@@ -308,7 +336,9 @@ def _solve_assignment(
     # ---- 后缀 DP：layers[i] = dp[i]，dict[offset -> 后缀最小代价] ----
     layers: list[dict[int, int]] = [dict() for _ in range(n)]
 
-    # 最后一帧必须指派 last（offset = span）
+    # 最后一帧必须指派 last（offset = span）；若末帧被人工确认则必须一致
+    if n - 1 in pins and pins[n - 1] != span:
+        raise NoFeasibleSequenceError("人工确认帧号与固定末帧约束相冲突")
     layers[n - 1][span] = match_cost(n - 1, span)
 
     for i in range(n - 2, -1, -1):
@@ -320,24 +350,45 @@ def _solve_assignment(
         # 等价于以 x = span - offset 为坐标的经典递增滑动窗口。
         queue: deque[tuple[int, int]] = deque()
         next_layer = layers[i + 1]
-        for d in range(span - 1, -1, -1):
-            added = d + 1
-            suffix = next_layer.get(added)
-            if suffix is not None:
-                key = penalty_scaled * added + suffix
-                while queue and queue[-1][1] >= key:
-                    queue.pop()
-                queue.append((added, key))
-            # 窗口上界为 d + max_step，丢掉 offset 过大的队首
-            if queue and queue[0][0] > d + max_step:
-                queue.popleft()
-            if queue:
-                # min key - 30*(d+1) 即为最优后继带来的代价
-                best_transition = queue[0][1] - penalty_scaled * (d + 1)
-                layer[d] = match_cost(i, d) + best_transition
+        # 人工确认位置只允许取确认偏移；首帧固定 offset 0
+        fixed_d: int | None = 0 if i == 0 else pins.get(i)
+        if fixed_d is not None:
+            # 单点：直接在后继窗口 [d+1, d+max_step] 内枚举最优转移
+            # （max_step ≤ 11，开销可忽略），无需维护滑动窗口
+            d = fixed_d
+            if 0 <= d <= span - 1:
+                best_transition: int | None = None
+                upper = min(span, d + max_step)
+                for nd in range(d + 1, upper + 1):
+                    suffix = next_layer.get(nd)
+                    if suffix is None:
+                        continue
+                    value = penalty_scaled * (nd - d - 1) + suffix
+                    if best_transition is None or value < best_transition:
+                        best_transition = value
+                if best_transition is not None:
+                    layer[d] = match_cost(i, d) + best_transition
+        else:
+            for d in range(span - 1, -1, -1):
+                added = d + 1
+                suffix = next_layer.get(added)
+                if suffix is not None:
+                    key = penalty_scaled * added + suffix
+                    while queue and queue[-1][1] >= key:
+                        queue.pop()
+                    queue.append((added, key))
+                # 窗口上界为 d + max_step，丢掉 offset 过大的队首
+                if queue and queue[0][0] > d + max_step:
+                    queue.popleft()
+                if queue:
+                    # min key - 30*(d+1) 即为最优后继带来的代价
+                    best_transition = queue[0][1] - penalty_scaled * (d + 1)
+                    layer[d] = match_cost(i, d) + best_transition
         layers[i] = layer
 
-    # 第一帧必须指派 first（offset = 0）
+    # 第一帧必须指派 first（offset = 0）；若首帧被人工确认则必须一致
+    if 0 in pins and pins[0] != 0:
+        raise NoFeasibleSequenceError("人工确认帧号与固定首帧约束相冲突")
     if 0 not in layers[0]:
         # 理论上已被前置可行性检查覆盖，保留防御性报错。
         raise NoFeasibleSequenceError("无法形成从首帧到末帧的合法帧号序列")
@@ -346,7 +397,13 @@ def _solve_assignment(
 
     # 对称的前缀 DP：prefix[i][d] = 第 i 帧取 offset d 时，第 0..i 帧的
     # 最小总代价（不含 i 之后的缺帧代价）。第一帧固定 offset 0。
-    prefix = _prefix_layers(n, span, max_step, penalty_scaled, match_cost)
+    # 仅歧义/核验接口需要；确认指派下同样把各层限制在允许偏移上。
+    if with_prefix:
+        prefix = _prefix_layers(
+            n, span, max_step, penalty_scaled, match_cost, pins
+        )
+    else:
+        prefix = []
 
     return {
         "first": first,
@@ -356,7 +413,9 @@ def _solve_assignment(
         "n": n,
         "parsed": parsed,
         "best_by_frame": best_by_frame,
-        "offsets": _backtrack_offsets(layers, span, max_step, penalty_scaled),
+        "offsets": _backtrack_offsets(
+            layers, span, max_step, penalty_scaled, pins
+        ),
         "total_cost": total_cost,
         "cost_scale": scale,
         "suffix_layers": layers,
@@ -371,31 +430,51 @@ def _prefix_layers(
     max_step: int,
     penalty_scaled: int,
     match_cost: Any,
+    pins: dict[int, int] | None = None,
 ) -> list[dict[int, int]]:
+    pins = pins or {}
     prefix: list[dict[int, int]] = [dict() for _ in range(n)]
     prefix[0][0] = match_cost(0, 0)
     for i in range(1, n):
         layer: dict[int, int] = {}
+        # 人工确认位置只允许取确认偏移；末帧固定 offset span
+        fixed_d: int | None = span if i == n - 1 else pins.get(i)
         # 单调队列元素 (offset, key)，按 d 从小到大扫描：
         # - 新 offset（前驱 d-1）从队尾加入，过小（出窗）的从队首淘汰；
         # - key = -30*offset + prefix[i-1][offset]，队首到队尾严格递增，
         #   队首即前驱窗口最小值。
         queue: deque[tuple[int, int]] = deque()
         prev_layer = prefix[i - 1]
-        for d in range(1, span + 1):
-            added = d - 1
-            prev = prev_layer.get(added)
-            if prev is not None:
-                key = -penalty_scaled * added + prev
-                while queue and queue[-1][1] >= key:
-                    queue.pop()
-                queue.append((added, key))
-            # 窗口下界为 d - max_step，丢掉 offset 过小的队首
-            if queue and queue[0][0] < d - max_step:
-                queue.popleft()
-            if queue:
-                best_transition = queue[0][1] + penalty_scaled * (d - 1)
-                layer[d] = match_cost(i, d) + best_transition
+        if fixed_d is not None:
+            # 单点：直接在前驱窗口 [d-max_step, d-1] 内枚举最优转移
+            d = fixed_d
+            if 1 <= d <= span:
+                best_transition: int | None = None
+                lower = max(0, d - max_step)
+                for pd in range(d - 1, lower - 1, -1):
+                    prev = prev_layer.get(pd)
+                    if prev is None:
+                        continue
+                    value = penalty_scaled * (d - pd - 1) + prev
+                    if best_transition is None or value < best_transition:
+                        best_transition = value
+                if best_transition is not None:
+                    layer[d] = match_cost(i, d) + best_transition
+        else:
+            for d in range(1, span + 1):
+                added = d - 1
+                prev = prev_layer.get(added)
+                if prev is not None:
+                    key = -penalty_scaled * added + prev
+                    while queue and queue[-1][1] >= key:
+                        queue.pop()
+                    queue.append((added, key))
+                # 窗口下界为 d - max_step，丢掉 offset 过小的队首
+                if queue and queue[0][0] < d - max_step:
+                    queue.popleft()
+                if queue:
+                    best_transition = queue[0][1] + penalty_scaled * (d - 1)
+                    layer[d] = match_cost(i, d) + best_transition
         prefix[i] = layer
     return prefix
 
@@ -405,8 +484,14 @@ def _backtrack_offsets(
     span: int,
     max_step: int,
     penalty_scaled: int,
+    pins: dict[int, int] | None = None,
 ) -> list[int]:
-    """在后缀 DP 上回溯字典序最小的最优指派偏移序列。"""
+    """在后缀 DP 上回溯字典序最小的最优指派偏移序列。
+
+    人工确认位置直接取确认偏移（其后缀最优与历史无关，前缀贪心仍能在
+    各自由位置选到全局最优且字典序最小的序列）。
+    """
+    pins = pins or {}
     n = len(layers)
     offsets: list[int] = [0]
     for i in range(n - 1):
@@ -415,7 +500,14 @@ def _backtrack_offsets(
         chosen_value: int | None = None
         upper = min(span, d + max_step)
         next_layer = layers[i + 1]
-        for nd in range(d + 1, upper + 1):
+        candidates = (
+            (pins[i + 1],)
+            if i + 1 in pins
+            else range(d + 1, upper + 1)
+        )
+        for nd in candidates:
+            if not (d + 1 <= nd <= upper):
+                continue
             suffix = next_layer.get(nd)
             if suffix is None:
                 continue
@@ -541,27 +633,13 @@ def _missing_frame_numbers(
 # ---- 对外接口 ----
 
 
-def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
-    """执行帧号复核。
-
-    入参字段：
-        first / last: int，固定首末帧号（last > first）
-        max_missing_between: int，0～10
-        frames: [{id, candidates: [{frame_number: int, confidence: 0~100}]}]
-
-    返回逐帧指派、每帧舍弃的候选、缺失帧号与各项代价汇总。
-    参数不合法时抛 InvalidRangeError，无合法序列时抛 NoFeasibleSequenceError。
-    """
-    frames = payload.get("frames")
-    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
-        raise InvalidRangeError(
-            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
-        )
-
-    first, last, gap = _validate_endpoints(payload)
-    parsed = _parse_frames(frames)
-    solution = _solve_assignment(first, last, gap, parsed)
-
+def _assemble_review_response(
+    first: int,
+    last: int,
+    gap: int,
+    solution: dict[str, Any],
+) -> dict[str, Any]:
+    """把内部指派解法组装成逐帧复核响应（逐帧复核/人工确认复核共用）。"""
     n = solution["n"]
 
     (
@@ -581,8 +659,6 @@ def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
         first, last, set(assigned_numbers)
     )
 
-    computed_total = sum_match_cost + sum_missing_penalty
-    assert computed_total == total_cost, "代价明细与 DP 总代价不一致"
     assert total_cost == Decimal(solution["total_cost"]) / solution["cost_scale"], (
         "代价明细与整数 DP 总代价不一致"
     )
@@ -604,6 +680,181 @@ def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
         "discarded_candidate_count": total_discarded,
         "frames": result_frames,
     }
+
+
+def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行帧号复核。
+
+    入参字段：
+        first / last: int，固定首末帧号（last > first）
+        max_missing_between: int，0～10
+        frames: [{id, candidates: [{frame_number: int, confidence: 0~100}]}]
+
+    返回逐帧指派、每帧舍弃的候选、缺失帧号与各项代价汇总。
+    参数不合法时抛 InvalidRangeError，无合法序列时抛 NoFeasibleSequenceError。
+    """
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
+        raise InvalidRangeError(
+            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
+        )
+
+    first, last, gap = _validate_endpoints(payload)
+    parsed = _parse_frames(frames)
+    solution = _solve_assignment(first, last, gap, parsed)
+    return _assemble_review_response(first, last, gap, solution)
+
+
+# 人工确认复核的边界
+MIN_CONFIRMATIONS = 1
+MAX_CONFIRMATIONS = 12
+
+
+def _parse_confirmations(
+    confirmations: Any,
+    n: int,
+    first: int,
+    last: int,
+) -> list[tuple[int, int]]:
+    """解析人工确认列表，返回按 position 升序的 (位置下标, 帧号)。
+
+    1～12 条；position 从 1 起且在帧序列范围内、不得重复；frame_number
+    必须是落在 [first, last] 内的整数。确认之间（及与首末帧之间）的
+    严格递增/步长冲突属于语义冲突，不在此处理，由不可行流程报告。
+    """
+    if not isinstance(confirmations, list) or not (
+        MIN_CONFIRMATIONS <= len(confirmations) <= MAX_CONFIRMATIONS
+    ):
+        raise InvalidRangeError(
+            f"confirmations 数量必须在 {MIN_CONFIRMATIONS}～{MAX_CONFIRMATIONS} 之间"
+        )
+    parsed: list[tuple[int, int]] = []
+    seen_positions: set[int] = set()
+    for k, item in enumerate(confirmations):
+        label = f"第 {k + 1} 条人工确认"
+        if not isinstance(item, dict):
+            raise InvalidRangeError(f"{label}格式不正确")
+        position = item.get("position")
+        if not isinstance(position, int) or isinstance(position, bool):
+            raise InvalidRangeError(f"{label}的 position 必须是整数")
+        if not (1 <= position <= n):
+            raise InvalidRangeError(
+                f"{label}的 position 必须在 1～{n} 之间（当前 {position}）"
+            )
+        if position in seen_positions:
+            raise InvalidRangeError(
+                f"人工确认的 position 不得重复（position {position} 重复）"
+            )
+        seen_positions.add(position)
+        number = item.get("frame_number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            raise InvalidRangeError(f"{label}的 frame_number 必须是整数")
+        if not (first <= number <= last):
+            raise InvalidRangeError(
+                f"{label}的 frame_number 必须在 [{first}, {last}] 之内"
+                f"（当前 {number}）"
+            )
+        parsed.append((position - 1, number))
+    parsed.sort(key=lambda pair: pair[0])
+    return parsed
+
+
+def _assignment_feasible(
+    first: int,
+    last: int,
+    gap: int,
+    parsed: list[tuple[Any, list[dict[str, Any]]]],
+    pins: dict[int, int],
+) -> bool:
+    """带给定人工确认的指派是否存在合法序列。"""
+    try:
+        _solve_assignment(
+            first, last, gap, parsed, pins=pins, with_prefix=False
+        )
+    except NoFeasibleSequenceError:
+        return False
+    return True
+
+
+def _irreducible_conflicts(
+    first: int,
+    last: int,
+    gap: int,
+    parsed: list[tuple[Any, list[dict[str, Any]]]],
+    confirmations: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """求不可再删减的冲突确认集（按位置升序）。
+
+    从全集开始按位置升序逐条尝试删除：若删除后仍无解，说明该确认并非
+    恢复可行性所必需，永久删除；若删除后有解，则恢复它并继续。最终留下
+    的每条都删不掉（删除即恢复可行），构成一个极小（不可再删减）冲突集。
+    """
+    kept: list[tuple[int, int]] = list(confirmations)
+    for pos, number in confirmations:
+        candidate = [(p, num) for p, num in kept if p != pos]
+        if not _assignment_feasible(
+            first, last, gap, parsed, {p: num for p, num in candidate}
+        ):
+            kept = candidate
+    return kept
+
+
+def solve_confirmed_review(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行带人工确认的帧号复核。
+
+    入参在 solve_review 全部字段之外另收：
+        confirmations: 1～12 条 {position, frame_number}，position 从 1
+        起、不重复，frame_number 落在 [first, last] 内。
+
+    被确认的位置只能取确认帧号，其余位置沿用同一套首末帧固定、严格递增、
+    相邻缺帧上限与代价规则求最低代价指派（同分仍按帧号序列字典序取小）；
+    确认帧号未命中候选时该帧按推断计价，成功响应与逐帧复核完全一致。
+
+    没有任何确认时已无解 -> 沿用 no_feasible_sequence；确认导致无解 ->
+    抛 ConflictingConfirmationsError，携带按位置升序的不可再删减冲突集。
+    """
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
+        raise InvalidRangeError(
+            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
+        )
+
+    first, last, gap = _validate_endpoints(payload)
+    parsed = _parse_frames(frames)
+
+    # 先判定“无确认时”的可行性：若本就无解，沿用 no_feasible_sequence
+    try:
+        _solve_assignment(
+            first, last, gap, parsed, with_prefix=False
+        )
+    except NoFeasibleSequenceError:
+        raise
+
+    confirmations = _parse_confirmations(
+        payload.get("confirmations"), len(parsed), first, last
+    )
+    pins = {pos: number for pos, number in confirmations}
+
+    try:
+        solution = _solve_assignment(
+            first, last, gap, parsed, pins=pins, with_prefix=False
+        )
+    except NoFeasibleSequenceError as exc:
+        conflicts = _irreducible_conflicts(
+            first, last, gap, parsed, confirmations
+        )
+        raise ConflictingConfirmationsError(
+            "人工确认与固定首末帧、严格递增或相邻缺帧上限相冲突："
+            + "、".join(
+                f"第 {pos + 1} 帧确认帧号 {number}" for pos, number in conflicts
+            ),
+            [
+                {"position": pos + 1, "frame_number": number}
+                for pos, number in conflicts
+            ],
+        ) from exc
+
+    return _assemble_review_response(first, last, gap, solution)
 
 
 def solve_ambiguity_review(payload: dict[str, Any]) -> dict[str, Any]:
