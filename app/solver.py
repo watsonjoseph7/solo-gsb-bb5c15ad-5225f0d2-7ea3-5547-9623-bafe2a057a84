@@ -17,6 +17,10 @@
 胶片条各自的方向（原序 / 整条倒序），条间顺序固定，在所有方向组合的合法
 指派中按总代价、倒序条数、方向向量、指派帧号序列依次裁决。
 
+人工确认复核（:func:`solve_confirmed_frame_review`）在同一 DP 上把若干
+位置钉死为人工确认帧号：被确认位置只保留对应偏移，其余规则（首末帧
+固定、严格递增、相邻缺帧上限、代价与字典序同分裁决）完全不变。
+
 复扫窗口规划（:func:`solve_rescan_plan`）复用复核结果，把缺失帧号与
 source=inferred 帧的指派帧号合并去重为复扫目标，再划分成互不重叠、
 长度受限的连续帧号窗口，按总成本、窗口数、起止点序列依次裁决。
@@ -101,6 +105,11 @@ DIRECTION_FORWARD = 0
 DIRECTION_REVERSED = 1
 
 
+# 人工确认复核的边界
+MIN_CONFIRMATIONS = 1
+MAX_CONFIRMATIONS = 12
+
+
 class ReviewError(Exception):
     """业务校验失败的基类，携带机器可读的 code。"""
 
@@ -123,6 +132,17 @@ class NoFeasibleCombinationError(ReviewError):
     """胶片条的所有方向组合都不存在合法指派。"""
 
     code = "no_feasible_combination"
+
+
+class ConflictingConfirmationsError(ReviewError):
+    """无确认时存在合法序列，但人工确认集合导致不存在合法序列。"""
+
+    code = "conflicting_confirmations"
+
+    def __init__(self, message: str, conflicts: list[dict[str, int]]):
+        super().__init__(message)
+        # 不可再删减的冲突确认集（按 position 升序）
+        self.conflicts = conflicts
 
 
 def _to_decimal(value: Any, field: str, range_desc: str = "0～100") -> Decimal:
@@ -265,17 +285,28 @@ def _solve_assignment(
     last: int,
     gap: int,
     parsed: list[tuple[Any, list[dict[str, Any]]]],
+    fixed_offsets: dict[int, int] | None = None,
 ) -> dict[str, Any]:
     """对一条已按扫描顺序排好的帧序列执行帧号指派。
 
-    返回内部解法（代价为乘以 cost_scale 的整数），供两个接口各自组装
+    ``fixed_offsets`` 给出被人工确认钉死的 {帧下标: 偏移}（偏移 =
+    确认帧号 - first）；这些位置只允许取对应偏移，其余位置不受限制。
+    首末帧本就固定为 offset 0 / span，钉死成其他值等价于无解。
+
+    返回内部解法（代价为乘以 cost_scale 的整数），供各个接口各自组装
     响应；无合法序列时抛 NoFeasibleSequenceError。
     """
+    fixed_offsets = fixed_offsets or {}
     n = len(parsed)
     span = last - first
     max_step = gap + 1  # 相邻指派帧号之差上限（差 1 表示不缺帧）
 
     best_by_frame = _best_candidates(parsed)
+
+    def allowed(i: int, d: int) -> bool:
+        """该位置是否允许取该偏移（人工确认钉死的位置只放行确认值）。"""
+        forced = fixed_offsets.get(i)
+        return forced is None or forced == d
 
     # ---- 可行性前置检查 ----
     if span < n - 1:
@@ -288,6 +319,27 @@ def _solve_assignment(
             f"帧号跨度为 {span}，但 {n} 帧在相邻最多缺 {gap} 帧的限制下"
             f"最多只能跨越 {(n - 1) * max_step}，无法覆盖到末帧 {last}"
         )
+    # 钉死位置之间（含首末帧）需满足严格递增与相邻缺帧上限
+    pinned = sorted(
+        {(0, 0), (n - 1, span)}
+        | {(i, d) for i, d in fixed_offsets.items()}
+    )
+    for (i1, d1), (i2, d2) in zip(pinned, pinned[1:]):
+        step_span = d2 - d1
+        frame_gap = i2 - i1
+        if step_span < frame_gap:
+            raise NoFeasibleSequenceError(
+                f"第 {i2 + 1} 帧确认帧号 {first + d2} 与第 {i1 + 1} 帧"
+                f"（{first + d1}）之间只有 {step_span} 个帧号差，"
+                f"无法容纳中间的 {frame_gap - 1} 帧严格递增指派"
+            )
+        if step_span > frame_gap * max_step:
+            raise NoFeasibleSequenceError(
+                f"第 {i1 + 1} 帧（{first + d1}）与第 {i2 + 1} 帧确认帧号"
+                f" {first + d2} 相差 {step_span}，但中间 {frame_gap - 1} 帧"
+                f"在相邻最多缺 {gap} 帧的限制下最多只能跨越"
+                f" {frame_gap * max_step}"
+            )
 
     # ---- 代价统一放大成整数：推断 100、缺帧 30、命中 100-置信分 ----
     scale = _cost_scale(parsed)
@@ -309,7 +361,8 @@ def _solve_assignment(
     layers: list[dict[int, int]] = [dict() for _ in range(n)]
 
     # 最后一帧必须指派 last（offset = span）
-    layers[n - 1][span] = match_cost(n - 1, span)
+    if allowed(n - 1, span):
+        layers[n - 1][span] = match_cost(n - 1, span)
 
     for i in range(n - 2, -1, -1):
         layer: dict[int, int] = {}
@@ -331,7 +384,8 @@ def _solve_assignment(
             # 窗口上界为 d + max_step，丢掉 offset 过大的队首
             if queue and queue[0][0] > d + max_step:
                 queue.popleft()
-            if queue:
+            # 被人工确认钉死的位置只保留确认偏移
+            if queue and allowed(i, d):
                 # min key - 30*(d+1) 即为最优后继带来的代价
                 best_transition = queue[0][1] - penalty_scaled * (d + 1)
                 layer[d] = match_cost(i, d) + best_transition
@@ -346,7 +400,9 @@ def _solve_assignment(
 
     # 对称的前缀 DP：prefix[i][d] = 第 i 帧取 offset d 时，第 0..i 帧的
     # 最小总代价（不含 i 之后的缺帧代价）。第一帧固定 offset 0。
-    prefix = _prefix_layers(n, span, max_step, penalty_scaled, match_cost)
+    prefix = _prefix_layers(
+        n, span, max_step, penalty_scaled, match_cost, allowed
+    )
 
     return {
         "first": first,
@@ -356,7 +412,9 @@ def _solve_assignment(
         "n": n,
         "parsed": parsed,
         "best_by_frame": best_by_frame,
-        "offsets": _backtrack_offsets(layers, span, max_step, penalty_scaled),
+        "offsets": _backtrack_offsets(
+            layers, span, max_step, penalty_scaled, allowed
+        ),
         "total_cost": total_cost,
         "cost_scale": scale,
         "suffix_layers": layers,
@@ -371,9 +429,11 @@ def _prefix_layers(
     max_step: int,
     penalty_scaled: int,
     match_cost: Any,
+    allowed: Any,
 ) -> list[dict[int, int]]:
     prefix: list[dict[int, int]] = [dict() for _ in range(n)]
-    prefix[0][0] = match_cost(0, 0)
+    if allowed(0, 0):
+        prefix[0][0] = match_cost(0, 0)
     for i in range(1, n):
         layer: dict[int, int] = {}
         # 单调队列元素 (offset, key)，按 d 从小到大扫描：
@@ -393,7 +453,7 @@ def _prefix_layers(
             # 窗口下界为 d - max_step，丢掉 offset 过小的队首
             if queue and queue[0][0] < d - max_step:
                 queue.popleft()
-            if queue:
+            if queue and allowed(i, d):
                 best_transition = queue[0][1] + penalty_scaled * (d - 1)
                 layer[d] = match_cost(i, d) + best_transition
         prefix[i] = layer
@@ -405,6 +465,7 @@ def _backtrack_offsets(
     span: int,
     max_step: int,
     penalty_scaled: int,
+    allowed: Any,
 ) -> list[int]:
     """在后缀 DP 上回溯字典序最小的最优指派偏移序列。"""
     n = len(layers)
@@ -416,6 +477,8 @@ def _backtrack_offsets(
         upper = min(span, d + max_step)
         next_layer = layers[i + 1]
         for nd in range(d + 1, upper + 1):
+            if not allowed(i + 1, nd):
+                continue  # 人工确认钉死的位置只回溯到确认偏移
             suffix = next_layer.get(nd)
             if suffix is None:
                 continue
@@ -541,27 +604,13 @@ def _missing_frame_numbers(
 # ---- 对外接口 ----
 
 
-def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
-    """执行帧号复核。
-
-    入参字段：
-        first / last: int，固定首末帧号（last > first）
-        max_missing_between: int，0～10
-        frames: [{id, candidates: [{frame_number: int, confidence: 0~100}]}]
-
-    返回逐帧指派、每帧舍弃的候选、缺失帧号与各项代价汇总。
-    参数不合法时抛 InvalidRangeError，无合法序列时抛 NoFeasibleSequenceError。
-    """
-    frames = payload.get("frames")
-    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
-        raise InvalidRangeError(
-            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
-        )
-
-    first, last, gap = _validate_endpoints(payload)
-    parsed = _parse_frames(frames)
-    solution = _solve_assignment(first, last, gap, parsed)
-
+def _assemble_review_result(
+    first: int,
+    last: int,
+    gap: int,
+    solution: dict[str, Any],
+) -> dict[str, Any]:
+    """把内部指派解法组装成逐帧复核响应（逐帧复核与人工确认复核共用）。"""
     n = solution["n"]
 
     (
@@ -581,8 +630,6 @@ def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
         first, last, set(assigned_numbers)
     )
 
-    computed_total = sum_match_cost + sum_missing_penalty
-    assert computed_total == total_cost, "代价明细与 DP 总代价不一致"
     assert total_cost == Decimal(solution["total_cost"]) / solution["cost_scale"], (
         "代价明细与整数 DP 总代价不一致"
     )
@@ -604,6 +651,130 @@ def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
         "discarded_candidate_count": total_discarded,
         "frames": result_frames,
     }
+
+
+def solve_review(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行帧号复核。
+
+    入参字段：
+        first / last: int，固定首末帧号（last > first）
+        max_missing_between: int，0～10
+        frames: [{id, candidates: [{frame_number: int, confidence: 0~100}]}]
+
+    返回逐帧指派、每帧舍弃的候选、缺失帧号与各项代价汇总。
+    参数不合法时抛 InvalidRangeError，无合法序列时抛 NoFeasibleSequenceError。
+    """
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
+        raise InvalidRangeError(
+            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
+        )
+
+    first, last, gap = _validate_endpoints(payload)
+    parsed = _parse_frames(frames)
+    solution = _solve_assignment(first, last, gap, parsed)
+    return _assemble_review_result(first, last, gap, solution)
+
+
+def _parse_confirmations(
+    raw: Any,
+    n: int,
+    first: int,
+    last: int,
+) -> dict[int, int]:
+    """校验人工确认列表，返回 {帧下标(0-based): 确认帧号}。
+
+    接受 1～12 条 {position, frame_number}：position 从 1 起且不得重复，
+    frame_number 必须为落在 [first, last] 的整数。
+    """
+    if not isinstance(raw, list) or not (
+        MIN_CONFIRMATIONS <= len(raw) <= MAX_CONFIRMATIONS
+    ):
+        raise InvalidRangeError(
+            f"confirmations 数量必须在 {MIN_CONFIRMATIONS}～{MAX_CONFIRMATIONS} 之间"
+        )
+
+    confirmed: dict[int, int] = {}
+    for j, item in enumerate(raw):
+        label = f"第 {j + 1} 条确认"
+        if not isinstance(item, dict):
+            raise InvalidRangeError(f"{label}格式不正确，需包含 position 与 frame_number")
+        position = item.get("position")
+        if not isinstance(position, int) or isinstance(position, bool):
+            raise InvalidRangeError(f"{label}的 position 必须是整数")
+        if not (1 <= position <= n):
+            raise InvalidRangeError(
+                f"{label}的 position 必须在 1～{n} 之间（当前 {position}）"
+            )
+        frame_number = item.get("frame_number")
+        if not isinstance(frame_number, int) or isinstance(frame_number, bool):
+            raise InvalidRangeError(f"{label}的 frame_number 必须是整数")
+        if not (first <= frame_number <= last):
+            raise InvalidRangeError(
+                f"{label}（position={position}）的 frame_number 必须落在"
+                f" [{first}, {last}] 内（当前 {frame_number}）"
+            )
+        index = position - 1
+        if index in confirmed:
+            raise InvalidRangeError(
+                f"position={position} 的确认重复：每个位置至多确认一次"
+            )
+        confirmed[index] = frame_number
+    return confirmed
+
+
+def solve_confirmed_frame_review(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行带人工确认的帧号复核。
+
+    入参为 :func:`solve_review` 的全部字段，另加
+        confirmations: 1～12 条 {position, frame_number}，
+        position 从 1 起且不得重复，frame_number 落在 [first, last]。
+
+    被确认位置只能指派确认帧号；未命中该帧候选时仍按推断计价（100），
+    其余位置按原规则求解：首末帧固定、严格递增、相邻缺帧上限不变，
+    取总代价最小、同分时帧号序列字典序最小的方案，响应明细与逐帧复核
+    完全相同。无确认时已无解沿用 no_feasible_sequence；确认本身导致
+    无解时抛 ConflictingConfirmationsError（422 /
+    conflicting_confirmations），携带按位置升序、不可再删减的冲突确认集。
+    """
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not (MIN_FRAMES <= len(frames) <= MAX_FRAMES):
+        raise InvalidRangeError(
+            f"frames 数量必须在 {MIN_FRAMES}～{MAX_FRAMES} 之间"
+        )
+
+    first, last, gap = _validate_endpoints(payload)
+    n = len(frames)
+    parsed = _parse_frames(frames)
+    confirmed = _parse_confirmations(payload.get("confirmations"), n, first, last)
+
+    # 先求无确认解：基础问题本身无解时沿用 no_feasible_sequence
+    _solve_assignment(first, last, gap, parsed)
+
+    fixed_offsets = {index: number - first for index, number in confirmed.items()}
+    try:
+        solution = _solve_assignment(first, last, gap, parsed, fixed_offsets)
+    except NoFeasibleSequenceError:
+        # 从全集按位置升序逐条尝试删除：删除后仍无解就永久删除，
+        # 删除后变得可行则恢复保留；最终留下的即不可再删减的冲突确认集。
+        retained: dict[int, int] = dict(fixed_offsets)
+        for index in sorted(fixed_offsets):
+            trial = {i: d for i, d in retained.items() if i != index}
+            try:
+                _solve_assignment(first, last, gap, parsed, trial)
+            except NoFeasibleSequenceError:
+                retained.pop(index)  # 删了仍然无解 -> 永久删除
+        conflicts = [
+            {"position": index + 1, "frame_number": first + retained[index]}
+            for index in sorted(retained)
+        ]
+        raise ConflictingConfirmationsError(
+            "人工确认帧号与首末帧固定、严格递增及相邻缺帧上限约束冲突，"
+            "不存在满足全部确认的合法帧号序列",
+            conflicts,
+        ) from None
+
+    return _assemble_review_result(first, last, gap, solution)
 
 
 def solve_ambiguity_review(payload: dict[str, Any]) -> dict[str, Any]:

@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.schemas import (
     AmbiguityReviewResponse,
+    ConfirmedFrameReviewRequest,
     ErrorResponse,
     RescanPlanRequest,
     RescanPlanResponse,
@@ -17,10 +18,12 @@ from app.schemas import (
     VerificationPlanResponse,
 )
 from app.solver import (
+    ConflictingConfirmationsError,
     InvalidRangeError,
     NoFeasibleCombinationError,
     NoFeasibleSequenceError,
     solve_ambiguity_review,
+    solve_confirmed_frame_review,
     solve_rescan_plan,
     solve_review,
     solve_strip_directions,
@@ -40,8 +43,11 @@ app = FastAPI(
         "供人工确认尚不能唯一确定帧号的扫描帧。"
         "人工核验计划接口进一步利用最优路径的分叉与汇合关系，"
         "求出能唯一锁定基准指派的最少人工核验帧集合。"
+        "人工确认复核接口则接收 1～12 条人工确认帧，把对应位置钉死为"
+        "确认帧号（未命中候选仍按推断计价），在确认约束下求最低代价指派，"
+        "确认导致无解时返回不可再删减的冲突确认集。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -75,6 +81,21 @@ async def no_feasible_combination_handler(
     )
 
 
+@app.exception_handler(ConflictingConfirmationsError)
+async def conflicting_confirmations_handler(
+    _request: Request, exc: ConflictingConfirmationsError
+) -> JSONResponse:
+    # 基础问题有解、但人工确认集合导致无合法序列 -> 422，附冲突确认集
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": exc.code,
+            "message": exc.message,
+            "conflicting_confirmations": exc.conflicts,
+        },
+    )
+
+
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -89,6 +110,27 @@ async def health() -> dict[str, str]:
 )
 async def review_frames(request: ReviewRequest) -> ReviewResponse:
     result = solve_review(request.model_dump())
+    return ReviewResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/confirmed-frame-reviews",
+    response_model=ReviewResponse,
+    tags=["review"],
+    summary="在人工确认帧号约束下复核扫描帧的帧号指派",
+    responses={
+        422: {
+            "model": ErrorResponse,
+            "description": (
+                "参数非法、无确认时已无合法序列，或人工确认相互冲突"
+            ),
+        }
+    },
+)
+async def review_confirmed_frames(
+    request: ConfirmedFrameReviewRequest,
+) -> ReviewResponse:
+    result = solve_confirmed_frame_review(request.model_dump())
     return ReviewResponse.model_validate(result)
 
 

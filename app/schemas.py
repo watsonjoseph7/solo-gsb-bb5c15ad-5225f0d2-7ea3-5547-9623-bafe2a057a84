@@ -72,6 +72,32 @@ class RescanPlanRequest(BaseModel):
     )
 
 
+class ConfirmationIn(BaseModel):
+    position: int = Field(
+        ..., ge=1, description="人工确认帧所在的扫描顺序位置，从 1 开始"
+    )
+    frame_number: int = Field(
+        ..., description="人工确认的真实帧号，必须落在 [first, last] 内"
+    )
+
+
+class ConfirmedFrameReviewRequest(BaseModel):
+    first: int = Field(..., description="固定首帧号")
+    last: int = Field(..., description="固定末帧号（必须严格大于 first）")
+    max_missing_between: int = Field(
+        ..., ge=0, le=10, description="相邻两帧之间最多允许缺帧的数量，0～10"
+    )
+    frames: list[FrameIn] = Field(
+        ..., min_length=2, max_length=100, description="按扫描顺序排列的 2～100 帧"
+    )
+    confirmations: list[ConfirmationIn] = Field(
+        ...,
+        min_length=1,
+        max_length=12,
+        description="1～12 条人工确认；position 从 1 起且不得重复",
+    )
+
+
 class DiscardedCandidateOut(BaseModel):
     candidate_index: int = Field(..., description="该候选在输入 candidates 中的下标")
     frame_number: int
@@ -261,8 +287,23 @@ class RescanPlanResponse(BaseModel):
     )
 
 
+class ConflictingConfirmationOut(BaseModel):
+    position: int = Field(..., description="冲突确认所在的扫描顺序位置，从 1 开始")
+    frame_number: int = Field(..., description="该位置被人工确认的帧号")
+
+
 class ErrorResponse(BaseModel):
     error: Literal[
-        "invalid_range", "no_feasible_sequence", "no_feasible_combination"
+        "invalid_range",
+        "no_feasible_sequence",
+        "no_feasible_combination",
+        "conflicting_confirmations",
     ]
     message: str
+    conflicting_confirmations: Union[list[ConflictingConfirmationOut], None] = Field(
+        default=None,
+        description=(
+            "仅 error=conflicting_confirmations 时出现：按位置升序、"
+            "不可再删减的冲突确认集"
+        ),
+    )
