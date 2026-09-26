@@ -1,0 +1,14 @@
+services:
+  frame-review-api:
+    build: .
+    image: film-frame-review-api:latest
+    container_name: film-frame-review-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
